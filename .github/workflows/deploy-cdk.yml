@@ -1,0 +1,74 @@
+# Deploys this repository’s AWS CDK app to your AWS account (CloudFormation).
+# Prereqs: CDK bootstrapped in the target account/region; IAM role for GitHub OIDC (see comments).
+name: Deploy CDK (AWS)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: cdk-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: CDK deploy
+        run: npx cdk deploy --all --require-approval never
+
+# --- GitHub configuration ---
+#
+# 1) Repository variable (optional): AWS_REGION  (e.g. eu-west-2). Defaults to us-east-1.
+#
+# 2) Repository secret (required): AWS_DEPLOY_ROLE_ARN
+#    IAM role ARN trusted by GitHub OIDC, with permissions for CDK deploy (and bootstrap stack).
+#    Trust policy example (replace ORG/REPO and AWS account):
+#      "Principal": { "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com" },
+#      "Action": "sts:AssumeRoleWithWebIdentity",
+#      "Condition": {
+#        "StringEquals": {
+#          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+#        },
+#        "StringLike": {
+#          "token.actions.githubusercontent.com:sub": "repo:ORG/REPO:ref:refs/heads/main"
+#        }
+#      }
+#
+# 3) One-time locally: cdk bootstrap aws://ACCOUNT/REGION
+#
+# If you cannot use OIDC yet, switch this workflow to access keys (less ideal):
+#   uses: aws-actions/configure-aws-credentials@v4
+#   with:
+#     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#     aws-region: ${{ env.AWS_REGION }}
+#   and remove `permissions: id-token: write` if not needed.
