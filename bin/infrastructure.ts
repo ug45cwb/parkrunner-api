@@ -14,7 +14,7 @@ const env =
       }
     : undefined;
 
-new DataStack(app, 'ParkrunHubDataStack', {
+const dataStack = new DataStack(app, 'ParkrunHubDataStack', {
   description: 'Data layer: DynamoDB and related storage',
   env,
 });
@@ -24,7 +24,9 @@ new ComputeStack(app, 'ParkrunHubComputeStack', {
   env,
 });
 
-new ApiStack(app, 'ParkrunHubApiStack', {
+const apiStack = new ApiStack(app, 'ParkrunHubApiStack', {
   description: 'API layer: Amazon API Gateway',
   env,
+  table: dataStack.table,
 });
+apiStack.addDependency(dataStack);
