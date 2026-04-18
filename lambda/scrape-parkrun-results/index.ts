@@ -6,7 +6,6 @@
 import { BatchWriteItemCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { marshall } from "@aws-sdk/util-dynamodb";
 import type { IncomingHttpHeaders } from "node:http";
-import * as http2 from "node:http2";
 import * as https from "node:https";
 import { URL } from "node:url";
 import { load } from "cheerio";
@@ -29,6 +28,13 @@ function commonBrowserHeaders(ua: string, referer?: string): Record<string, stri
       "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Accept-Encoding": "identity",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    Priority: "u=0, i",
+    "Sec-CH-UA":
+      '"Chromium";v="120", "Google Chrome";v="120", "Not_A Brand";v="24"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": referer ? "same-origin" : "none",
@@ -76,110 +82,21 @@ async function httpsGetOnce(
   });
 }
 
-async function http2GetOnce(
-  urlStr: string,
-  referer: string | undefined,
-): Promise<{ statusCode: number; headers: IncomingHttpHeaders; body: Buffer }> {
-  const ua = process.env.HTTP_USER_AGENT?.trim() || DEFAULT_UA;
-  const u = new URL(urlStr);
-  const h = commonBrowserHeaders(ua, referer);
-
-  const session = http2.connect(`https://${u.hostname}`);
-  return new Promise((resolve, reject) => {
-    session.on("error", reject);
-    const reqHeaders: http2.OutgoingHttpHeaders = {
-      ":method": "GET",
-      ":path": `${u.pathname}${u.search}`,
-      ":scheme": "https",
-      ":authority": u.host,
-      ...h,
-    };
-    const req = session.request(reqHeaders);
-    const chunks: Buffer[] = [];
-    req.on("response", (headers) => {
-      const status = Number(headers[":status"] ?? 0);
-      req.on("data", (c: Buffer) => chunks.push(c));
-      req.on("end", () => {
-        session.close();
-        resolve({
-          statusCode: status,
-          headers: headers as IncomingHttpHeaders,
-          body: Buffer.concat(chunks),
-        });
-      });
-    });
-    req.on("error", (e) => {
-      session.destroy();
-      reject(e);
-    });
-    req.end();
-  });
-}
-
-type FetchMode = "https" | "http2";
-
-async function fetchOne(
-  urlStr: string,
-  referer: string | undefined,
-  mode: FetchMode,
-): Promise<{ statusCode: number; headers: IncomingHttpHeaders; body: Buffer }> {
-  return mode === "http2"
-    ? http2GetOnce(urlStr, referer)
-    : httpsGetOnce(urlStr, referer);
-}
-
 /**
- * GET the results HTML with redirect handling. Tries HTTP/1.1 then HTTP/2 and
- * omits duplicate Host (which can produce HTTP 405 on some CDNs).
+ * GET a page over plain HTTPS GET with redirect handling.
  */
-async function fetchResultsHtml(
+async function fetchHtmlWithRedirects(
   startUrl: string,
+  referer?: string,
 ): Promise<{ finalUrl: string; html: string }> {
   let current = normalizeResultsUrl(startUrl);
-  let lastReferer: string | undefined;
+  let lastReferer = referer;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    let statusCode = 0;
-    let headers: IncomingHttpHeaders = {};
-    let body = Buffer.alloc(0);
-
-    let lastErr: Error | undefined;
-    let gotUsableResponse = false;
-
-    for (const mode of ["https", "http2"] as const) {
-      try {
-        const r = await fetchOne(current, lastReferer, mode);
-        statusCode = r.statusCode;
-        headers = r.headers;
-        body = Buffer.from(r.body);
-        lastErr = undefined;
-
-        const location = headers.location;
-        const loc =
-          typeof location === "string"
-            ? location
-            : Array.isArray(location)
-              ? location[0]
-              : undefined;
-        const isRedirect =
-          statusCode >= 300 && statusCode < 400 && Boolean(loc);
-
-        if (statusCode === 200 || isRedirect) {
-          gotUsableResponse = true;
-          break;
-        }
-
-        lastErr = new Error(
-          `HTTP ${statusCode} from ${mode} (url: ${current})`,
-        );
-      } catch (e) {
-        lastErr = e instanceof Error ? e : new Error(String(e));
-      }
-    }
-
-    if (!gotUsableResponse && lastErr) {
-      throw lastErr;
-    }
+    const r = await httpsGetOnce(current, lastReferer);
+    const statusCode = r.statusCode;
+    const headers = r.headers;
+    const body = Buffer.from(r.body);
 
     const location = headers.location;
     const loc =
@@ -196,7 +113,7 @@ async function fetchResultsHtml(
 
     if (statusCode !== 200) {
       throw new Error(
-        `Failed to fetch results page: HTTP ${statusCode} (url: ${current}). ` +
+        `Failed to fetch page: HTTP ${statusCode} (url: ${current}). ` +
           `If this persists from Lambda only, parkrun may be blocking datacenter IPs; ` +
           `invoke with { "htmlBase64": "<saved page as base64>" } to skip HTTP fetch.`,
       );
@@ -206,6 +123,63 @@ async function fetchResultsHtml(
   }
 
   throw new Error("Too many redirects when fetching results page");
+}
+
+function getHistoryUrlForEvent(eventSlug: string): string {
+  return `https://www.parkrun.org.uk/${eventSlug}/results/`;
+}
+
+function findDatedResultsUrlFromHistory(
+  historyHtml: string,
+  historyUrl: string,
+  eventSlug: string,
+  date: string,
+): string | undefined {
+  const $ = load(historyHtml);
+  const targetPath = `/${eventSlug}/results/${date}/`;
+
+  for (const el of $("a[href]").toArray()) {
+    const href = $(el).attr("href");
+    if (!href) {
+      continue;
+    }
+
+    const absolute = normalizeResultsUrl(new URL(href, historyUrl).href);
+    const parsed = new URL(absolute);
+    if (parsed.pathname.toLowerCase() === targetPath.toLowerCase()) {
+      return absolute;
+    }
+  }
+
+  return undefined;
+}
+
+async function fetchResultsHtml(
+  startUrl: string,
+): Promise<{ finalUrl: string; html: string }> {
+  const normalizedStart = normalizeResultsUrl(startUrl);
+  const { eventSlug, date } = parseResultsUrl(normalizedStart);
+  const historyUrl = getHistoryUrlForEvent(eventSlug);
+  const history = await fetchHtmlWithRedirects(historyUrl);
+  const resolvedUrl =
+    findDatedResultsUrlFromHistory(
+      history.html,
+      history.finalUrl,
+      eventSlug,
+      date,
+    ) ?? normalizedStart;
+
+  if (resolvedUrl !== normalizedStart) {
+    console.log(
+      `Resolved dated results URL via history flow: ${normalizedStart} -> ${resolvedUrl}`,
+    );
+  } else {
+    console.log(
+      `History flow did not expose ${normalizedStart}; falling back to direct dated URL fetch.`,
+    );
+  }
+
+  return fetchHtmlWithRedirects(resolvedUrl, history.finalUrl);
 }
 
 type ScrapeEvent = {
@@ -320,6 +294,9 @@ export async function handler(rawEvent: ScrapeEvent | Record<string, unknown>) {
     finalUrl = fetched.finalUrl;
     html = fetched.html;
   }
+
+  console.log("Fetched results HTML before parsing:");
+  console.log(html);
 
   const finishers = parseFinishers(html);
 
