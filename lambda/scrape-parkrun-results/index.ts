@@ -5,10 +5,98 @@
  */
 import { BatchWriteItemCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { marshall } from "@aws-sdk/util-dynamodb";
+import type { IncomingHttpHeaders } from "node:http";
+import * as https from "node:https";
+import { URL } from "node:url";
 import { load } from "cheerio";
 
+/** Match a normal desktop Chrome request; some CDNs return 405/403 to bare or “bot” agents. */
 const DEFAULT_UA =
-  "Mozilla/5.0 (compatible; parkrun-hub/1.0; +https://github.com/parkrun-hub) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+const MAX_REDIRECTS = 5;
+
+function normalizeResultsUrl(url: string): string {
+  const t = url.trim();
+  return t.endsWith("/") ? t : `${t}/`;
+}
+
+/**
+ * Plain HTTPS GET (no global fetch): avoids Undici/fetch quirks in Lambda that
+ * can surface as HTTP 405 against some front-ends.
+ */
+async function fetchResultsHtml(
+  startUrl: string,
+): Promise<{ finalUrl: string; html: string }> {
+  const ua = process.env.HTTP_USER_AGENT?.trim() || DEFAULT_UA;
+  let current = normalizeResultsUrl(startUrl);
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const u = new URL(current);
+    const referer = `${u.origin}/`;
+
+    const { statusCode, headers, body } = await new Promise<{
+      statusCode: number;
+      headers: IncomingHttpHeaders;
+      body: Buffer;
+    }>((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: u.hostname,
+          port: u.port || 443,
+          path: `${u.pathname}${u.search}`,
+          method: "GET",
+          headers: {
+            Host: u.hostname,
+            "User-Agent": ua,
+            Accept:
+              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Accept-Encoding": "identity",
+            Referer: referer,
+            Connection: "close",
+            "Upgrade-Insecure-Requests": "1",
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            resolve({
+              statusCode: res.statusCode ?? 0,
+              headers: res.headers,
+              body: Buffer.concat(chunks),
+            });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+
+    const location = headers.location;
+    const loc =
+      typeof location === "string"
+        ? location
+        : Array.isArray(location)
+          ? location[0]
+          : undefined;
+    if (statusCode >= 300 && statusCode < 400 && loc) {
+      current = new URL(loc, current).href;
+      continue;
+    }
+
+    if (statusCode !== 200) {
+      throw new Error(
+        `Failed to fetch results page: HTTP ${statusCode} (url: ${current})`,
+      );
+    }
+
+    return { finalUrl: current, html: body.toString("utf8") };
+  }
+
+  throw new Error("Too many redirects when fetching results page");
+}
 
 type ScrapeEvent = { url?: string };
 
@@ -89,23 +177,12 @@ export async function handler(rawEvent: ScrapeEvent | Record<string, unknown>) {
     );
   }
 
-  const { eventSlug, date } = parseResultsUrl(url.trim());
+  const normalizedStart = normalizeResultsUrl(url.trim());
+  const { eventSlug, date } = parseResultsUrl(normalizedStart);
   const scrapedAt = new Date().toISOString();
   const pk = `PARKRUN_EVENT#${eventSlug}#${date}`;
 
-  const res = await fetch(url.trim(), {
-    headers: {
-      "User-Agent": process.env.HTTP_USER_AGENT?.trim() || DEFAULT_UA,
-      Accept: "text/html,application/xhtml+xml",
-      "Accept-Language": "en-GB,en;q=0.9",
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to fetch results page: HTTP ${res.status}`);
-  }
-
-  const html = await res.text();
+  const { finalUrl, html } = await fetchResultsHtml(normalizedStart);
   const finishers = parseFinishers(html);
 
   if (finishers.length === 0) {
@@ -129,7 +206,7 @@ export async function handler(rawEvent: ScrapeEvent | Record<string, unknown>) {
       ageGroup: f.ageGroup,
       gender: f.gender,
       club: f.club,
-      sourceUrl: url.trim(),
+      sourceUrl: finalUrl,
       scrapedAt,
     }),
   );
@@ -156,6 +233,6 @@ export async function handler(rawEvent: ScrapeEvent | Record<string, unknown>) {
     ok: true,
     pk,
     finishersWritten: written,
-    sourceUrl: url.trim(),
+    sourceUrl: finalUrl,
   };
 }
