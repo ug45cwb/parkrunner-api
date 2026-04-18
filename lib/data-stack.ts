@@ -1,6 +1,9 @@
+import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Construct } from 'constructs';
 import { SEED_REVISION, SEED_ROWS, type SeedRow } from './seed-data';
 
@@ -69,5 +72,34 @@ export class DataStack extends cdk.Stack {
       });
       seed.node.addDependency(this.table);
     });
+
+    const resultsPageUrl =
+      'https://www.parkrun.org.uk/southmanchester/results/2026-04-18/';
+
+    const parkrunScraper = new NodejsFunction(this, 'ParkrunResultsScraper', {
+      description:
+        'Scrapes a parkrun results page HTML and writes finisher rows to DynamoDB',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: path.join(
+        __dirname,
+        '..',
+        'lambda',
+        'scrape-parkrun-results',
+        'index.ts',
+      ),
+      handler: 'handler',
+      timeout: cdk.Duration.minutes(2),
+      memorySize: 512,
+      environment: {
+        TABLE_NAME: this.table.tableName,
+        RESULTS_PAGE_URL: resultsPageUrl,
+      },
+      bundling: {
+        minify: true,
+        sourceMap: false,
+        target: 'node20',
+      },
+    });
+    this.table.grantWriteData(parkrunScraper);
   }
 }
