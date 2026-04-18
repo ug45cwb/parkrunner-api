@@ -6,6 +6,7 @@
 import { BatchWriteItemCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { marshall } from "@aws-sdk/util-dynamodb";
 import type { IncomingHttpHeaders } from "node:http";
+import * as http2 from "node:http2";
 import * as https from "node:https";
 import { URL } from "node:url";
 import { load } from "cheerio";
@@ -21,58 +22,164 @@ function normalizeResultsUrl(url: string): string {
   return t.endsWith("/") ? t : `${t}/`;
 }
 
+function commonBrowserHeaders(ua: string, referer?: string): Record<string, string> {
+  const h: Record<string, string> = {
+    "User-Agent": ua,
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Accept-Encoding": "identity",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": referer ? "same-origin" : "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+  };
+  if (referer) {
+    h.Referer = referer;
+  }
+  return h;
+}
+
+async function httpsGetOnce(
+  urlStr: string,
+  referer: string | undefined,
+): Promise<{ statusCode: number; headers: IncomingHttpHeaders; body: Buffer }> {
+  const ua = process.env.HTTP_USER_AGENT?.trim() || DEFAULT_UA;
+  const u = new URL(urlStr);
+  const headers = commonBrowserHeaders(ua, referer);
+  // Do not set `Host` — Node sets it from `hostname`. A duplicate Host breaks some edges (HTTP 405).
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: `${u.pathname}${u.search}`,
+        method: "GET",
+        headers,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks),
+          });
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function http2GetOnce(
+  urlStr: string,
+  referer: string | undefined,
+): Promise<{ statusCode: number; headers: IncomingHttpHeaders; body: Buffer }> {
+  const ua = process.env.HTTP_USER_AGENT?.trim() || DEFAULT_UA;
+  const u = new URL(urlStr);
+  const h = commonBrowserHeaders(ua, referer);
+
+  const session = http2.connect(`https://${u.hostname}`);
+  return new Promise((resolve, reject) => {
+    session.on("error", reject);
+    const reqHeaders: http2.OutgoingHttpHeaders = {
+      ":method": "GET",
+      ":path": `${u.pathname}${u.search}`,
+      ":scheme": "https",
+      ":authority": u.host,
+      ...h,
+    };
+    const req = session.request(reqHeaders);
+    const chunks: Buffer[] = [];
+    req.on("response", (headers) => {
+      const status = Number(headers[":status"] ?? 0);
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        session.close();
+        resolve({
+          statusCode: status,
+          headers: headers as IncomingHttpHeaders,
+          body: Buffer.concat(chunks),
+        });
+      });
+    });
+    req.on("error", (e) => {
+      session.destroy();
+      reject(e);
+    });
+    req.end();
+  });
+}
+
+type FetchMode = "https" | "http2";
+
+async function fetchOne(
+  urlStr: string,
+  referer: string | undefined,
+  mode: FetchMode,
+): Promise<{ statusCode: number; headers: IncomingHttpHeaders; body: Buffer }> {
+  return mode === "http2"
+    ? http2GetOnce(urlStr, referer)
+    : httpsGetOnce(urlStr, referer);
+}
+
 /**
- * Plain HTTPS GET (no global fetch): avoids Undici/fetch quirks in Lambda that
- * can surface as HTTP 405 against some front-ends.
+ * GET the results HTML with redirect handling. Tries HTTP/1.1 then HTTP/2 and
+ * omits duplicate Host (which can produce HTTP 405 on some CDNs).
  */
 async function fetchResultsHtml(
   startUrl: string,
 ): Promise<{ finalUrl: string; html: string }> {
-  const ua = process.env.HTTP_USER_AGENT?.trim() || DEFAULT_UA;
   let current = normalizeResultsUrl(startUrl);
+  let lastReferer: string | undefined;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const u = new URL(current);
-    const referer = `${u.origin}/`;
+    let statusCode = 0;
+    let headers: IncomingHttpHeaders = {};
+    let body = Buffer.alloc(0);
 
-    const { statusCode, headers, body } = await new Promise<{
-      statusCode: number;
-      headers: IncomingHttpHeaders;
-      body: Buffer;
-    }>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: u.hostname,
-          port: u.port || 443,
-          path: `${u.pathname}${u.search}`,
-          method: "GET",
-          headers: {
-            Host: u.hostname,
-            "User-Agent": ua,
-            Accept:
-              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Accept-Encoding": "identity",
-            Referer: referer,
-            Connection: "close",
-            "Upgrade-Insecure-Requests": "1",
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (c: Buffer) => chunks.push(c));
-          res.on("end", () => {
-            resolve({
-              statusCode: res.statusCode ?? 0,
-              headers: res.headers,
-              body: Buffer.concat(chunks),
-            });
-          });
-        },
-      );
-      req.on("error", reject);
-      req.end();
-    });
+    let lastErr: Error | undefined;
+    let gotUsableResponse = false;
+
+    for (const mode of ["https", "http2"] as const) {
+      try {
+        const r = await fetchOne(current, lastReferer, mode);
+        statusCode = r.statusCode;
+        headers = r.headers;
+        body = Buffer.from(r.body);
+        lastErr = undefined;
+
+        const location = headers.location;
+        const loc =
+          typeof location === "string"
+            ? location
+            : Array.isArray(location)
+              ? location[0]
+              : undefined;
+        const isRedirect =
+          statusCode >= 300 && statusCode < 400 && Boolean(loc);
+
+        if (statusCode === 200 || isRedirect) {
+          gotUsableResponse = true;
+          break;
+        }
+
+        lastErr = new Error(
+          `HTTP ${statusCode} from ${mode} (url: ${current})`,
+        );
+      } catch (e) {
+        lastErr = e instanceof Error ? e : new Error(String(e));
+      }
+    }
+
+    if (!gotUsableResponse && lastErr) {
+      throw lastErr;
+    }
 
     const location = headers.location;
     const loc =
@@ -82,13 +189,16 @@ async function fetchResultsHtml(
           ? location[0]
           : undefined;
     if (statusCode >= 300 && statusCode < 400 && loc) {
+      lastReferer = current;
       current = new URL(loc, current).href;
       continue;
     }
 
     if (statusCode !== 200) {
       throw new Error(
-        `Failed to fetch results page: HTTP ${statusCode} (url: ${current})`,
+        `Failed to fetch results page: HTTP ${statusCode} (url: ${current}). ` +
+          `If this persists from Lambda only, parkrun may be blocking datacenter IPs; ` +
+          `invoke with { "htmlBase64": "<saved page as base64>" } to skip HTTP fetch.`,
       );
     }
 
@@ -98,7 +208,11 @@ async function fetchResultsHtml(
   throw new Error("Too many redirects when fetching results page");
 }
 
-type ScrapeEvent = { url?: string };
+type ScrapeEvent = {
+  /** When set, skip HTTP and parse this HTML (base64). Use if parkrun blocks Lambda IPs. */
+  htmlBase64?: string;
+  url?: string;
+};
 
 type Finisher = {
   position: number;
@@ -166,23 +280,47 @@ export async function handler(rawEvent: ScrapeEvent | Record<string, unknown>) {
     throw new Error("TABLE_NAME environment variable is required");
   }
 
-  const url =
-    (rawEvent && typeof rawEvent === "object" && typeof rawEvent.url === "string"
-      ? rawEvent.url
-      : undefined) ?? process.env.RESULTS_PAGE_URL;
+  const payload =
+    rawEvent && typeof rawEvent === "object" ? (rawEvent as ScrapeEvent) : {};
 
-  if (!url?.trim()) {
+  const htmlFromPayload =
+    typeof payload.htmlBase64 === "string" &&
+    payload.htmlBase64.trim().length > 0
+      ? Buffer.from(payload.htmlBase64, "base64").toString("utf8")
+      : undefined;
+
+  const url =
+    (typeof payload.url === "string" ? payload.url : undefined) ??
+    process.env.RESULTS_PAGE_URL;
+
+  if (!url?.trim() && !htmlFromPayload) {
     throw new Error(
-      "Set RESULTS_PAGE_URL on the function or pass { \"url\": \"…\" } in the invocation payload",
+      "Set RESULTS_PAGE_URL on the function or pass { \"url\": \"…\" } (and optionally { \"htmlBase64\": \"…\" }) in the invocation payload",
     );
   }
 
-  const normalizedStart = normalizeResultsUrl(url.trim());
+  if (htmlFromPayload && !url?.trim()) {
+    throw new Error(
+      "When passing htmlBase64 you must also provide url (in the payload or RESULTS_PAGE_URL) so event slug and date can be parsed for DynamoDB keys.",
+    );
+  }
+
+  const normalizedStart = normalizeResultsUrl(url!.trim());
   const { eventSlug, date } = parseResultsUrl(normalizedStart);
   const scrapedAt = new Date().toISOString();
   const pk = `PARKRUN_EVENT#${eventSlug}#${date}`;
 
-  const { finalUrl, html } = await fetchResultsHtml(normalizedStart);
+  let finalUrl: string;
+  let html: string;
+  if (htmlFromPayload) {
+    finalUrl = normalizedStart;
+    html = htmlFromPayload;
+  } else {
+    const fetched = await fetchResultsHtml(normalizedStart);
+    finalUrl = fetched.finalUrl;
+    html = fetched.html;
+  }
+
   const finishers = parseFinishers(html);
 
   if (finishers.length === 0) {
@@ -234,5 +372,6 @@ export async function handler(rawEvent: ScrapeEvent | Record<string, unknown>) {
     pk,
     finishersWritten: written,
     sourceUrl: finalUrl,
+    usedHtmlPayload: Boolean(htmlFromPayload),
   };
 }
