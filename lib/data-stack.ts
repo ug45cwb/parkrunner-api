@@ -77,8 +77,7 @@ export class DataStack extends cdk.Stack {
       'https://www.parkrun.org.uk/southmanchester/results/2026-04-18/';
 
     const parkrunScraper = new NodejsFunction(this, 'ParkrunResultsScraper', {
-      description:
-        'Scrapes a parkrun results page HTML and writes finisher rows to DynamoDB',
+      description: 'GET a parkrun URL and log status, headers, and body',
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: path.join(
         __dirname,
@@ -91,7 +90,6 @@ export class DataStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(2),
       memorySize: 512,
       environment: {
-        TABLE_NAME: this.table.tableName,
         RESULTS_PAGE_URL: resultsPageUrl,
       },
       bundling: {
@@ -100,6 +98,5 @@ export class DataStack extends cdk.Stack {
         target: 'node20',
       },
     });
-    this.table.grantWriteData(parkrunScraper);
   }
 }
