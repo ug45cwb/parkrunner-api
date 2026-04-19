@@ -12,7 +12,7 @@ import { load } from "cheerio";
 
 /** Match a normal desktop Chrome request; some CDNs return 405/403 to bare or “bot” agents. */
 const DEFAULT_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 const MAX_REDIRECTS = 5;
 
@@ -32,7 +32,7 @@ function commonBrowserHeaders(ua: string, referer?: string): Record<string, stri
     Pragma: "no-cache",
     Priority: "u=0, i",
     "Sec-CH-UA":
-      '"Chromium";v="120", "Google Chrome";v="120", "Not_A Brand";v="24"',
+      '"Chromium";v="147", "Google Chrome";v="147", "Not_A Brand";v="24"',
     "Sec-CH-UA-Mobile": "?0",
     "Sec-CH-UA-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
